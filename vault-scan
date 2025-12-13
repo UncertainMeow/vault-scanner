@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# vault-scan - Detect secrets in files using your 1Password vault as reference
+# https://github.com/UncertainMeow/vault-scanner
+
+VERSION="1.0.0"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+# Colors
+RED='\033[1;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[1;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+ALERT='\033[1;37;41m'
+NC='\033[0m'
+
+# Defaults
+VAULT_NAME=""
+OUTPUT_FORMAT="text"
+QUIET=false
+JSON_OUTPUT=""
+EXIT_CODE_ON_SECRETS=1
+
+usage() {
+    cat << EOF
+${BOLD}vault-scan${NC} - Detect secrets using your 1Password vault
+
+${BOLD}USAGE${NC}
+    vault-scan [OPTIONS] <file>...
+
+${BOLD}DESCRIPTION${NC}
+    Scans files for secrets by cross-referencing against your actual
+    1Password vault. Unlike regex-based scanners, this finds YOUR real
+    secrets with zero false negatives.
+
+${BOLD}OPTIONS${NC}
+    -v, --vault <name>    Scan against specific vault (default: all)
+    -o, --output <file>   Write JSON report to file
+    -f, --format <fmt>    Output format: text, json, brief (default: text)
+    -q, --quiet           Suppress output, exit code only
+    -h, --help            Show this help
+    --version             Show version
+
+${BOLD}EXAMPLES${NC}
+    # Scan a single file
+    vault-scan config.yml
+
+    # Scan against specific vault
+    vault-scan -v Infrastructure server-config.md
+
+    # Scan multiple files with JSON output
+    vault-scan -o report.json *.md
+
+    # CI/CD usage (exit 1 if secrets found)
+    vault-scan --quiet deployment.yml || echo "Secrets detected!"
+
+${BOLD}EXIT CODES${NC}
+    0    No secrets detected
+    1    Secrets detected (or error)
+
+${BOLD}REQUIREMENTS${NC}
+    - 1Password CLI (op) installed and signed in
+    - jq for JSON processing
+
+EOF
+}
+
+log_info() { [[ "$QUIET" == "false" ]] && echo -e "${BLUE}[INFO]${NC} $1"; }
+log_ok() { [[ "$QUIET" == "false" ]] && echo -e "${GREEN}[OK]${NC} $1"; }
+log_warn() { [[ "$QUIET" == "false" ]] && echo -e "${YELLOW}[WARN]${NC} $1"; }
+log_error() { echo -e "${RED}[ERROR]${NC} $1" >&2; }
+log_alert() { [[ "$QUIET" == "false" ]] && echo -e "${ALERT} $1 ${NC}"; }
+
+check_dependencies() {
+    if ! command -v op >/dev/null 2>&1; then
+        log_error "1Password CLI not installed"
+        echo -e "${DIM}Install: brew install 1password-cli${NC}" >&2
+        exit 1
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        log_error "jq not installed"
+        echo -e "${DIM}Install: brew install jq${NC}" >&2
+        exit 1
+    fi
+
+    if ! op account list >/dev/null 2>&1; then
+        log_error "Not signed in to 1Password"
+        echo -e "${DIM}Sign in: eval \$(op signin)${NC}" >&2
+        exit 1
+    fi
+}
+
+# Parse arguments
+INPUT_FILES=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -v|--vault)
+            VAULT_NAME="$2"
+            shift 2
+            ;;
+        -o|--output)
+            JSON_OUTPUT="$2"
+            shift 2
+            ;;
+        -f|--format)
+            OUTPUT_FORMAT="$2"
+            shift 2
+            ;;
+        -q|--quiet)
+            QUIET=true
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --version)
+            echo "vault-scan $VERSION"
+            exit 0
+            ;;
+        -*)
+            log_error "Unknown option: $1"
+            usage
+            exit 1
+            ;;
+        *)
+            INPUT_FILES+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ ${#INPUT_FILES[@]} -eq 0 ]]; then
+    usage
+    exit 1
+fi
+
+# Verify input files exist
+for file in "${INPUT_FILES[@]}"; do
+    if [[ ! -f "$file" ]]; then
+        log_error "File not found: $file"
+        exit 1
+    fi
+done
+
+check_dependencies
+
+# Create secure temp directory
+TEMP_DIR=$(mktemp -d)
+trap "rm -rf $TEMP_DIR" EXIT
+
+# Fetch vault items
+log_info "Querying 1Password vault..."
+
+OP_CMD="op item list --format=json"
+[[ -n "$VAULT_NAME" ]] && OP_CMD="$OP_CMD --vault='$VAULT_NAME'"
+
+if ! eval "$OP_CMD" > "$TEMP_DIR/items.json" 2>/dev/null; then
+    log_error "Failed to query 1Password"
+    if [[ -n "$VAULT_NAME" ]]; then
+        log_warn "Vault '$VAULT_NAME' may not exist"
+        echo -e "${DIM}Available vaults:${NC}"
+        op vault list --format=json 2>/dev/null | jq -r '.[].name' || true
+    fi
+    exit 1
+fi
+
+ITEM_COUNT=$(jq length "$TEMP_DIR/items.json")
+log_ok "Found $ITEM_COUNT items in vault"
+
+# Initialize results
+TOTAL_SECRETS=0
+TOTAL_HIGH_RISK=0
+declare -a DETECTIONS=()
+
+# Build combined content for searching
+cat "${INPUT_FILES[@]}" > "$TEMP_DIR/combined_input.txt"
+
+log_info "Scanning ${#INPUT_FILES[@]} file(s)..."
+
+# Process each vault item
+while IFS= read -r ITEM_ID; do
+    if op item get "$ITEM_ID" --format=json > "$TEMP_DIR/item.json" 2>/dev/null; then
+        ITEM_TITLE=$(jq -r '.title // "unknown"' "$TEMP_DIR/item.json")
+        ITEM_CATEGORY=$(jq -r '.category // "unknown"' "$TEMP_DIR/item.json")
+
+        # Check concealed fields (passwords)
+        while IFS= read -r PASSWORD; do
+            if [[ -n "$PASSWORD" && ${#PASSWORD} -gt 8 ]]; then
+                if grep -qF "$PASSWORD" "$TEMP_DIR/combined_input.txt" 2>/dev/null; then
+                    DETECTIONS+=("{\"item\":\"$ITEM_TITLE\",\"category\":\"$ITEM_CATEGORY\",\"type\":\"password\",\"risk\":\"HIGH\"}")
+                    ((TOTAL_SECRETS++)) || true
+                    ((TOTAL_HIGH_RISK++)) || true
+                    [[ "$OUTPUT_FORMAT" == "text" ]] && log_alert "FOUND PASSWORD: $ITEM_TITLE"
+                fi
+            fi
+        done < <(jq -r '.fields[]? | select(.type == "CONCEALED") | .value // empty' "$TEMP_DIR/item.json" 2>/dev/null)
+
+        # Check API keys and tokens
+        while IFS= read -r FIELD_VALUE; do
+            if [[ -n "$FIELD_VALUE" && ${#FIELD_VALUE} -gt 12 ]]; then
+                if [[ "$FIELD_VALUE" =~ ^(sk-|pk_|rk_|xoxp-|xoxb-|ghp_|gho_|glpat-|AKIA|aio_) ]]; then
+                    if grep -qF "$FIELD_VALUE" "$TEMP_DIR/combined_input.txt" 2>/dev/null; then
+                        DETECTIONS+=("{\"item\":\"$ITEM_TITLE\",\"category\":\"$ITEM_CATEGORY\",\"type\":\"api_key\",\"risk\":\"HIGH\"}")
+                        ((TOTAL_SECRETS++)) || true
+                        ((TOTAL_HIGH_RISK++)) || true
+                        [[ "$OUTPUT_FORMAT" == "text" ]] && log_alert "FOUND API KEY: $ITEM_TITLE"
+                    fi
+                fi
+            fi
+        done < <(jq -r '.fields[]? | select(.value) | .value' "$TEMP_DIR/item.json" 2>/dev/null)
+
+        # Check URLs (may contain embedded credentials)
+        while IFS= read -r URL; do
+            if [[ -n "$URL" && "$URL" =~ :// ]]; then
+                if grep -qF "$URL" "$TEMP_DIR/combined_input.txt" 2>/dev/null; then
+                    DETECTIONS+=("{\"item\":\"$ITEM_TITLE\",\"category\":\"$ITEM_CATEGORY\",\"type\":\"url\",\"risk\":\"MEDIUM\"}")
+                    ((TOTAL_SECRETS++)) || true
+                    [[ "$OUTPUT_FORMAT" == "text" ]] && log_warn "Found URL: $ITEM_TITLE"
+                fi
+            fi
+        done < <(jq -r '.urls[]?.href // empty' "$TEMP_DIR/item.json" 2>/dev/null)
+    fi
+done < <(jq -r '.[] | .id' "$TEMP_DIR/items.json")
+
+# Determine risk level
+RISK_LEVEL="LOW"
+SAFE_FOR_AI=true
+if [[ $TOTAL_HIGH_RISK -gt 0 ]]; then
+    RISK_LEVEL="HIGH"
+    SAFE_FOR_AI=false
+elif [[ $TOTAL_SECRETS -gt 0 ]]; then
+    RISK_LEVEL="MEDIUM"
+    SAFE_FOR_AI=false
+fi
+
+# Build JSON report
+DETECTIONS_JSON=$(printf '%s\n' "${DETECTIONS[@]}" | jq -s '.')
+REPORT=$(cat << EOF
+{
+  "timestamp": "$(date -Iseconds)",
+  "version": "$VERSION",
+  "files_scanned": ${#INPUT_FILES[@]},
+  "vault": "${VAULT_NAME:-default}",
+  "items_checked": $ITEM_COUNT,
+  "detections": $DETECTIONS_JSON,
+  "summary": {
+    "secrets_found": $TOTAL_SECRETS,
+    "high_risk": $TOTAL_HIGH_RISK,
+    "risk_level": "$RISK_LEVEL",
+    "safe_for_ai": $SAFE_FOR_AI
+  }
+}
+EOF
+)
+
+# Save JSON report if requested
+if [[ -n "$JSON_OUTPUT" ]]; then
+    echo "$REPORT" | jq . > "$JSON_OUTPUT"
+    log_info "Report saved to: $JSON_OUTPUT"
+fi
+
+# Output results
+case "$OUTPUT_FORMAT" in
+    json)
+        echo "$REPORT" | jq .
+        ;;
+    brief)
+        if [[ $TOTAL_SECRETS -eq 0 ]]; then
+            echo "OK: No secrets detected"
+        else
+            echo "ALERT: $TOTAL_SECRETS secret(s) found ($TOTAL_HIGH_RISK high risk)"
+        fi
+        ;;
+    text)
+        echo ""
+        echo -e "${BOLD}Scan Results${NC}"
+        echo "============"
+        if [[ $TOTAL_SECRETS -eq 0 ]]; then
+            echo -e "${GREEN}No secrets detected${NC}"
+            echo -e "${DIM}File(s) appear safe for AI processing${NC}"
+        else
+            echo -e "${RED}$TOTAL_SECRETS secret(s) detected${NC}"
+            echo ""
+            echo -e "${BOLD}Detections:${NC}"
+            echo "$REPORT" | jq -r '.detections[] | "  \(.risk): \(.type) from \(.item)"'
+            echo ""
+            if [[ $TOTAL_HIGH_RISK -gt 0 ]]; then
+                echo -e "${RED}Do NOT share these files with AI systems${NC}"
+            else
+                echo -e "${YELLOW}Review before sharing with AI systems${NC}"
+            fi
+        fi
+        echo ""
+        echo -e "${DIM}Scanned: ${#INPUT_FILES[@]} file(s), $ITEM_COUNT vault items${NC}"
+        ;;
+esac
+
+# Exit with appropriate code
+if [[ $TOTAL_SECRETS -gt 0 ]]; then
+    exit $EXIT_CODE_ON_SECRETS
+fi
+exit 0

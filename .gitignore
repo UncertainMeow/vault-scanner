@@ -1,0 +1,20 @@
+# Temp files
+*.tmp
+*.bak
+
+# Reports with potential secrets
+*_analysis.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor files
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Test files with secrets
+test-secrets/

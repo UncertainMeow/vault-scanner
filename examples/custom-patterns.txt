@@ -1,0 +1,16 @@
+# Custom sanitization patterns for vault-sanitize
+# One sed pattern per line, lines starting with # are comments
+#
+# Usage: vault-sanitize -c custom-patterns.txt input.md output.md
+
+# Organization-specific API keys
+s/MYCOMPANY_[A-Z]+_KEY=[A-Za-z0-9]+/MYCOMPANY_KEY=[REDACTED]/g
+
+# Internal service tokens
+s/internal-svc-[a-z0-9]{16}/internal-svc-[REDACTED]/g
+
+# Custom webhook URLs
+s|https://hooks\.mycompany\.com/[A-Za-z0-9/_-]+|https://hooks.mycompany.com/[REDACTED]|g
+
+# JWT tokens (be careful - may have false positives)
+# s/eyJ[A-Za-z0-9_-]*\.eyJ[A-Za-z0-9_-]*\.[A-Za-z0-9_-]*/[JWT-REDACTED]/g
