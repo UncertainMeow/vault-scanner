@@ -204,5 +204,4 @@ vault-sanitize -c my-patterns.txt document.md clean.md
 
 ## Related
 
-- [khoj-utils](https://github.com/UncertainMeow/khoj-utils) - Session capture with Khoj integration
 - [1Password CLI](https://developer.1password.com/docs/cli/) - Official CLI documentation
